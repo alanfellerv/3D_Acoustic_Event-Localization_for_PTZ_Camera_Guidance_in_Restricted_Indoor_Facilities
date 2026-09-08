@@ -1,7 +1,8 @@
 %% MAIN - Acoustic DOA Localization Simulation
 % Pipeline (matches the system architecture flowchart):
 %   Audio Source --> Microphone Array --> Audio Acquisition & Noise
-%   Filtering (Band-Pass + VAD) --> Feature Extraction (MUSIC, GCC-PHAT)
+%   Filtering (Band-Pass + VAD) --> Feature Extraction (GCC-PHAT Delay,
+%   MUSIC Spectrum, ILD, RMS, FFT Features, Spectral Entropy) --> ...
 %   --> Estimated DOA Angle
 %
 %   1. Load array geometry                          (array_geometry.m)
@@ -11,6 +12,10 @@
 %   4. Trim to the VAD-active region, then run:
 %        - MUSIC DOA estimation (ReSpeaker 4-mic array)  (music_doa.m)
 %        - GCC-PHAT TDOA/angle (vertical mic pair)        (gcc_phat.m)
+%        - ILD                                            (ild_feature.m)
+%        - RMS                                            (rms_feature.m)
+%        - FFT Features                                   (fft_features.m)
+%        - Spectral Entropy                               (spectral_entropy.m)
 %   5. Compare estimates against ground truth and visualize results
 %
 % Requires: Phased Array System Toolbox, Signal Processing Toolbox
@@ -59,7 +64,7 @@ source_signal = envelope .* randn(N,1);
 % MUSICEstimator2D/MVDREstimator2D examples and is required for the
 % estimator to detect the source.
 sensor_SNR_dB = 20;
-f0 = 1000;                             % source tone frequency (Hz) (used as target bin)[cite: 4]
+f0 = 1000;                             % source tone frequency (Hz) (used as target bin)
 x_clean = collectPlaneWave(geom.array, source_signal, [az_true; el_true], f0, geom.c);
 
 mic_signals_raw = zeros(size(x_clean));
@@ -92,7 +97,6 @@ mic_A = mic_vert_f(idxV, 1);
 mic_B = mic_vert_f(idxV, 2);
 
 %% --- Step 5a: MUSIC DOA Estimation (ReSpeaker Array) ---
-f0 = 1000;   % target frequency bin, per architecture doc Step 5
 [az_est, el_est, musicEstimator] = music_doa(mic_signals_active, geom, f0);
 
 fprintf('--- MUSIC Estimation (ReSpeaker Quad Array) ---\n');
@@ -100,21 +104,40 @@ fprintf('True Azimuth   : %.2f deg | Estimated: %.2f deg\n', az_true, az_est);
 fprintf('True Elevation : %.2f deg | Estimated: %.2f deg\n\n', el_true, el_est);
 
 %% --- Step 5b: GCC-PHAT Estimation (Vertical Mic Pair) ---
-
-%------------------------------
-
-
-
-
-
-%-----------------------------
-
 [tdoa_est, angle_est_deg, corr, lags] = gcc_phat(mic_A, mic_B, geom, geom.d_vert);
-
 
 fprintf('--- GCC-PHAT Estimation (Vertical Mic Pair) ---\n');
 fprintf('True TDOA      : %.6e s | Estimated: %.6e s\n', tau_vert, tdoa_est);
 fprintf('True Elevation : %.2f deg | Estimated: %.2f deg\n\n', el_true, angle_est_deg);
+
+%% --- Step 5c: Feature Extraction (ILD, RMS, FFT Features, Spectral Entropy) ---
+% Matches the architecture flowchart's D3-D6 feature-extraction blocks.
+% Mic1/Mic2 (indices 1,2 in geom.r) differ only in x, so they act as a
+% horizontal ("left/right") pair for ILD - a cheap complementary azimuth
+% cue alongside MUSIC and GCC-PHAT.
+
+ild_dB = ild_feature(mic_signals_active(:,2), mic_signals_active(:,1));   % left=Mic2, right=Mic1
+
+rms_vals = rms_feature(mic_signals_active);        % 1x4, one per ReSpeaker channel
+rms_mean = mean(rms_vals);
+
+ref_channel = mean(mic_signals_active, 2);         % reference signal for FFT/entropy
+fft_feat = fft_features(ref_channel, geom.fs);
+
+[spec_H, spec_H_norm] = spectral_entropy(ref_channel, geom.fs);
+
+fprintf('--- Feature Extraction (Active Region) ---\n');
+fprintf('ILD (Mic1 vs Mic2)   : %.2f dB\n', ild_dB);
+fprintf('RMS per channel      : %s\n', mat2str(rms_vals, 4));
+fprintf('RMS (mean)           : %.4f\n', rms_mean);
+fprintf('FFT Peak Frequency   : %.1f Hz\n', fft_feat.peak_freq);
+fprintf('Spectral Centroid    : %.1f Hz\n', fft_feat.centroid);
+fprintf('Spectral Entropy     : %.4f bits (normalized: %.4f)\n\n', spec_H, spec_H_norm);
+
+featureTable = table( ...
+    {'ILD (dB)'; 'RMS (mean)'; 'FFT Peak Freq (Hz)'; 'Spectral Centroid (Hz)'; 'Spectral Entropy (norm)'}, ...
+    [ild_dB; rms_mean; fft_feat.peak_freq; fft_feat.centroid; spec_H_norm], ...
+    'VariableNames', {'Feature', 'Value'})
 
 %% --- Visualization ---
 
@@ -139,26 +162,6 @@ plot(t, mic_signals_f(:,1));
 xlabel('Time (s)'); ylabel('Amplitude'); grid on;
 title('Band-Pass Filtered Signal - Mic1, 300-3400 Hz (zoomed to active region)');
 xlim([zoom_start zoom_end]);
-
-% Raw vs band-pass filtered signal (Mic1), zoomed to the VAD-active region
-margin = 0.03;   % seconds of padding around the detected active region
-zoom_start = max(0,        (vad_ura.active_samples(1)-1)/geom.fs - margin);
-zoom_end   = min(duration, (vad_ura.active_samples(2)-1)/geom.fs + margin);
-
-% Figure for raw acquired signal
-figure;
-plot(t, mic_signals_raw(:,1));
-xlabel('Time (s)'); ylabel('Amplitude'); grid on;
-title('Raw Acquired Signal - Mic1 (zoomed to active region)');
-xlim([zoom_start zoom_end]);
-
-% Separate figure for band-pass filtered signal
-figure;
-plot(t, mic_signals_f(:,1));
-xlabel('Time (s)'); ylabel('Amplitude'); grid on;
-title('Band-Pass Filtered Signal - Mic1, 300-3400 Hz (zoomed to active region)');
-xlim([zoom_start zoom_end]);
-
 
 % Band-pass filter frequency response
 figure;
@@ -195,6 +198,15 @@ grid on; hold on;
 plot(lags(peak_idx)*1e3, abs(corr(peak_idx)), 'ro', 'MarkerSize', 8, 'LineWidth', 1.5);
 legend('GCC-PHAT', 'Peak (TDOA estimate)');
 
+% FFT magnitude spectrum with peak and centroid marked
+figure;
+plot(fft_feat.freq_axis, fft_feat.magnitude); hold on;
+xline(fft_feat.peak_freq, 'r--', 'Peak');
+xline(fft_feat.centroid,  'g--', 'Centroid');
+xlabel('Frequency (Hz)'); ylabel('Magnitude'); grid on;
+title('FFT Magnitude Spectrum (Active Region, Reference Channel)');
+xlim([0 geom.fs/2]);
+
 %% --- Summary Table for Presentation ---
 Method    = {'MUSIC (Azimuth)'; 'MUSIC (Elevation)'; 'GCC-PHAT (Elevation)'};
 TrueValue = [az_true; el_true; el_true];
@@ -206,18 +218,8 @@ resultsTable = table(Method, TrueValue, EstValue, ErrorDeg)
 
 %% --- Multi Ground-Truth Comparison Table ---
 % Re-runs the SAME acquisition -> filtering -> VAD -> trimming ->
-% MUSIC + GCC-PHAT pipeline used in the single-case experiment.
-%
-% IMPORTANT:
-% The ReSpeaker microphone signals are generated using collectPlaneWave(),
-% exactly as in the main single-case pipeline.
-%
-% Therefore:
-%
-%     mic_active
-%
-% inside run_doa_case() is processed in exactly the same way as the
-% mic_signals_active variable in the main experiment.
+% MUSIC + GCC-PHAT + feature-extraction pipeline used in the single-case
+% experiment, for several different ground-truth (az,el) pairs.
 
 test_cases = [ ...
      0    0;      % broadside
@@ -249,6 +251,11 @@ AzErrMUSIC  = zeros(num_cases,1);
 ElErrMUSIC  = zeros(num_cases,1);
 ElErrGCC    = zeros(num_cases,1);
 
+ILD_dB          = zeros(num_cases,1);
+RMS_mean        = zeros(num_cases,1);
+PeakFreqHz      = zeros(num_cases,1);
+SpecEntropyNorm = zeros(num_cases,1);
+
 % Separate reproducible random sequence for the sweep
 rng(2);
 
@@ -278,6 +285,11 @@ for c = 1:num_cases
     ElErrMUSIC(c)  = r.el_error_music;
     ElErrGCC(c)    = r.el_error_gcc;
 
+    ILD_dB(c)          = r.ild_dB;
+    RMS_mean(c)        = r.rms_mean;
+    PeakFreqHz(c)      = r.peak_freq;
+    SpecEntropyNorm(c) = r.spec_entropy_norm;
+
     fprintf('MUSIC Azimuth   = %.2f deg | Error = %.2f deg\n', ...
         r.az_est, r.az_error);
 
@@ -286,6 +298,9 @@ for c = 1:num_cases
 
     fprintf('GCC Elevation   = %.2f deg | Error = %.2f deg\n', ...
         r.gcc_angle_est, r.el_error_gcc);
+
+    fprintf('ILD = %.2f dB | RMS(mean) = %.4f | Peak Freq = %.1f Hz | Spectral Entropy(norm) = %.4f\n', ...
+        r.ild_dB, r.rms_mean, r.peak_freq, r.spec_entropy_norm);
 end
 
 
@@ -299,11 +314,15 @@ comparisonTable = table( ...
     AzErrMUSIC, ...
     ElErrMUSIC, ...
     ElEstGCC, ...
-    ElErrGCC);
+    ElErrGCC, ...
+    ILD_dB, ...
+    RMS_mean, ...
+    PeakFreqHz, ...
+    SpecEntropyNorm);
 
 disp(' ');
 disp('==============================================================');
-disp('          MULTI GROUND-TRUTH DOA COMPARISON');
+disp('          MULTI GROUND-TRUTH DOA + FEATURE COMPARISON');
 disp('==============================================================');
 
 disp(comparisonTable);
@@ -338,6 +357,34 @@ title('DOA Estimation Error Across Different Ground-Truth Directions');
 
 grid on;
 
+%% --- Bar Chart of Extracted Features Across Test Cases ---
+
+figure;
+subplot(2,1,1);
+bar([ILD_dB, RMS_mean]);
+set(gca, 'XTick', 1:num_cases, ...
+    'XTickLabel', arrayfun(@(c) sprintf('Az %d, El %d', test_cases(c,1), test_cases(c,2)), ...
+    1:num_cases, 'UniformOutput', false));
+xtickangle(30);
+ylabel('Value');
+legend('ILD (dB)', 'RMS (mean)', 'Location', 'best');
+title('ILD and RMS Across Different Ground-Truth Directions');
+grid on;
+
+subplot(2,1,2);
+yyaxis left;
+bar(PeakFreqHz);
+ylabel('FFT Peak Frequency (Hz)');
+yyaxis right;
+plot(1:num_cases, SpecEntropyNorm, '-o', 'LineWidth', 1.5);
+ylabel('Spectral Entropy (normalized)');
+set(gca, 'XTick', 1:num_cases, ...
+    'XTickLabel', arrayfun(@(c) sprintf('Az %d, El %d', test_cases(c,1), test_cases(c,2)), ...
+    1:num_cases, 'UniformOutput', false));
+xtickangle(30);
+title('FFT Peak Frequency and Spectral Entropy Across Test Cases');
+grid on;
+
 
 %% ======================= LOCAL FUNCTIONS ============================
 %
@@ -350,33 +397,21 @@ function results = run_doa_case(az_true, el_true, geom, params)
 % RUN_DOA_CASE
 %
 % Runs EXACTLY the same signal-processing pipeline as the main
-% single-ground-truth experiment:
+% single-ground-truth experiment, including feature extraction:
 %
 %   Source generation
-%       ↓
-%   collectPlaneWave()
-%       ↓
-%   AWGN
-%       ↓
-%   Band-pass filtering + VAD
-%       ↓
-%   VAD active-region trimming
-%       ↓
-%   mic_active
-%       ↓
-%   MUSIC
+%       -> collectPlaneWave()
+%       -> AWGN
+%       -> Band-pass filtering + VAD
+%       -> VAD active-region trimming
+%       -> mic_active
+%       -> MUSIC
+%       -> ILD / RMS / FFT Features / Spectral Entropy
 %
 % In parallel:
 %
-%   Source
-%       ↓
-%   Vertical microphone pair
-%       ↓
-%   Band-pass filtering + VAD
-%       ↓
-%   VAD active-region trimming
-%       ↓
-%   GCC-PHAT
+%   Source -> Vertical microphone pair -> Band-pass filtering + VAD
+%          -> VAD active-region trimming -> GCC-PHAT
 
 
 %% ---------------------------------------------------------------
@@ -413,19 +448,8 @@ src = envelope .* randn(N,1);
 
 
 %% ---------------------------------------------------------------
-% 3. ReSpeaker 4-channel acquisition
+% 3. ReSpeaker 4-channel acquisition (collectPlaneWave, matches main)
 % ---------------------------------------------------------------
-%
-% THIS IS THE IMPORTANT CORRECTION.
-%
-% The original main file uses:
-%
-% x_clean = collectPlaneWave(...)
-%
-% Therefore the multi-case function MUST use exactly the same method.
-%
-% Do NOT use delayseq() for the ReSpeaker array here.
-%
 
 x_clean = collectPlaneWave( ...
     geom.array, ...
@@ -454,8 +478,6 @@ end
 %% ---------------------------------------------------------------
 % 5. Generate vertical microphone pair
 % ---------------------------------------------------------------
-%
-% This is also kept consistent with the main file.
 
 tau_vert = ...
     (geom.d_vert * sin(el_rad)) / geom.c;
@@ -474,8 +496,6 @@ mic_B_raw = awgn( ...
 %% ---------------------------------------------------------------
 % 6. Band-pass filter + VAD
 % ---------------------------------------------------------------
-%
-% EXACTLY the same function calls as the main file.
 
 [mic_signals_f, vad_ura] = ...
     noise_filter(mic_signals_raw, geom.fs);
@@ -487,8 +507,6 @@ mic_B_raw = awgn( ...
 %% ---------------------------------------------------------------
 % 7. Trim using VAD
 % ---------------------------------------------------------------
-%
-% EXACTLY the same indexing method as the main file.
 
 idxU = ...
     vad_ura.active_samples(1): ...
@@ -502,12 +520,6 @@ idxV = ...
 %% ---------------------------------------------------------------
 % 8. Create mic_active
 % ---------------------------------------------------------------
-%
-% This is IDENTICAL to:
-%
-% mic_signals_active = mic_signals_f(idxU, :);
-%
-% in the main file.
 
 mic_active = mic_signals_f(idxU, :);
 
@@ -544,7 +556,22 @@ mic_B = mic_vert_f(idxV, 2);
 
 
 %% ---------------------------------------------------------------
-% 12. Calculate errors
+% 12. Feature extraction: ILD, RMS, FFT Features, Spectral Entropy
+% ---------------------------------------------------------------
+
+ild_dB = ild_feature(mic_active(:,2), mic_active(:,1));   % left=Mic2, right=Mic1
+
+rms_vals = rms_feature(mic_active);
+rms_mean = mean(rms_vals);
+
+ref_channel = mean(mic_active, 2);
+fft_feat = fft_features(ref_channel, geom.fs);
+
+[~, spec_H_norm] = spectral_entropy(ref_channel, geom.fs);
+
+
+%% ---------------------------------------------------------------
+% 13. Calculate errors and package results
 % ---------------------------------------------------------------
 
 results.az_true = az_true;
@@ -565,5 +592,10 @@ results.el_error_music = ...
 
 results.el_error_gcc = ...
     abs(el_true - gcc_angle_est);
+
+results.ild_dB           = ild_dB;
+results.rms_mean         = rms_mean;
+results.peak_freq        = fft_feat.peak_freq;
+results.spec_entropy_norm = spec_H_norm;
 
 end
