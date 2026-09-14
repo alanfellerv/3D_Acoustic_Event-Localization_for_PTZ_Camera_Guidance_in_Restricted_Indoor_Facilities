@@ -26,8 +26,8 @@ clear; clc; close all;
 geom = array_geometry();
 
 %% --- Ground Truth Source Direction ---
-az_true = 37;   % degrees
-el_true = 40;   % degrees
+az_true = 50;   % degrees
+el_true = 30;   % degrees
 
 az_rad = deg2rad(az_true);
 el_rad = deg2rad(el_true);
