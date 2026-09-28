@@ -26,8 +26,8 @@ clear; clc; close all;
 geom = array_geometry();
 
 %% --- Ground Truth Source Direction ---
-az_true = 37;   % degrees
-el_true = 40;   % degrees
+az_true = 50;   % degrees
+el_true = 30;   % degrees
 
 az_rad = deg2rad(az_true);
 el_rad = deg2rad(el_true);
@@ -93,6 +93,10 @@ idxU = vad_ura.active_samples(1):vad_ura.active_samples(2);
 idxV = vad_vert.active_samples(1):vad_vert.active_samples(2);
 
 mic_signals_active = mic_signals_f(idxU, :);
+micch1 = mic_signals_active(:, 1);
+micch2 = mic_signals_active(:, 2);
+micch3 = mic_signals_active(:, 3);
+micch4 = mic_signals_active(:, 4);
 mic_A = mic_vert_f(idxV, 1);
 mic_B = mic_vert_f(idxV, 2);
 
@@ -109,6 +113,82 @@ fprintf('True Elevation : %.2f deg | Estimated: %.2f deg\n\n', el_true, el_est);
 fprintf('--- GCC-PHAT Estimation (Vertical Mic Pair) ---\n');
 fprintf('True TDOA      : %.6e s | Estimated: %.6e s\n', tau_vert, tdoa_est);
 fprintf('True Elevation : %.2f deg | Estimated: %.2f deg\n\n', el_true, angle_est_deg);
+
+%% --- Broadband 4-channel signals for pairwise GCC-PHAT (true time delays) ---
+
+tau_mic = (geom.r * u) / geom.c;
+tau_mic = tau_mic - min(tau_mic);      % keep delays >= 0
+
+mic_bb_raw = zeros(N, 4);
+
+for i = 1:4
+    mic_bb_raw(:,i) = awgn( ...
+        delayseq(source_signal, tau_mic(i), geom.fs), ...
+        sensor_SNR_dB, 'measured');
+end
+
+[mic_bb_f, vad_bb] = noise_filter(mic_bb_raw, geom.fs);
+
+mic_bb_active = mic_bb_f( ...
+    vad_bb.active_samples(1):vad_bb.active_samples(2), :);
+
+
+%% --- Pairwise GCC-PHAT ---
+
+pairs = {
+    2, 1, geom.d_ura,          'Pair 2->1'
+    3, 4, geom.d_ura,          'Pair 3->4'
+    4, 1, geom.d_ura,          'Pair 4->1'
+    3, 2, geom.d_ura,          'Pair 3->2'
+    1, 3, geom.d_ura*sqrt(2),  'Pair 1->3'
+    2, 4, geom.d_ura*sqrt(2),  'Pair 2->4'
+};
+
+tau_x = [];
+tau_y = [];
+
+fprintf('\n========== PAIRWISE GCC-PHAT ==========\n');
+
+for k = 1:size(pairs, 1)
+
+    i = pairs{k,1};
+    j = pairs{k,2};
+    d = pairs{k,3};
+
+    [tdoa, angle_est, ~, ~] = gcc_phat( ...
+        mic_bb_active(:,i), ...
+        mic_bb_active(:,j), ...
+        geom, d);
+
+    tdoa_true = ((geom.r(j,:) - geom.r(i,:)) * u) / geom.c;
+
+    fprintf('\n%s\n', pairs{k,4});
+    fprintf('TDOA Estimated : %+.3e s\n', tdoa);
+    fprintf('TDOA True      : %+.3e s\n', tdoa_true);
+    fprintf('GCC-PHAT Angle : %.2f deg\n', angle_est);
+
+    % Keep the original X/Y angle-estimation calculation unchanged
+    if k <= 2
+        tau_x(end+1) = tdoa;
+    elseif k <= 4
+        tau_y(end+1) = tdoa;
+    end
+end
+
+
+%% --- Overall Azimuth and Elevation ---
+
+tx = mean(tau_x);
+ty = mean(tau_y);
+
+az_gcc = atan2d(ty, tx);
+
+el_gcc = acosd( ...
+    min(geom.c * hypot(tx, ty) / geom.d_ura, 1));
+
+fprintf('\n========== FINAL GCC-PHAT ==========\n');
+fprintf('GCC-PHAT Azimuth   : True %.2f deg | Estimated %.2f deg\n', ...
+    az_true, az_gcc);
 
 %% --- Step 5c: Feature Extraction (ILD, RMS, FFT Features, Spectral Entropy) ---
 % Matches the architecture flowchart's D3-D6 feature-extraction blocks.
